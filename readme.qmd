@@ -1,0 +1,159 @@
+---
+title: "Readme"
+format: 
+  gfm: default
+  pdf: default
+editor: visual
+toc: TRUE
+toc-depth: 4
+toc-expand : 5
+---
+
+## NO HARMS Identity Linkage
+
+This (sub)repository contains the code that implements record linkage for the NO HARMS project.
+
+## Methods and Code
+
+```{r, include=F}
+library('data.table')
+library('DBI')
+library('glue')
+library('parsnip')
+library('workflows')
+```
+
+### Process Flowchart
+
+![](noharms_flow.png)
+
+\^ A stylized flowchart. See `targets::tar_visnetwork(T)` for the full workflow. `targets::tar_visnetwork(T, exclude = c('theform', 'model_version', 'data_version', 'targetfile', 'tdsets', 'tdsets_files','targetfilepath', 'targetfilepath_files'))` might work better depending on how finicky the dag visualizer is feeling.
+
+### TLDR
+
+1.  A list of records (the unique combination of source system, source id, first name, middle name, last name, DOB, and ssn) to compare for a match based on the DOB and name characteristics are generated.
+2.  A small subset of the generated pairs are manually assessed for matchy-ness. These manually labeled pairs are the training data for the linkage model.
+3.  A linkage model is constructed using ensemble modeling. The predictors are based on variables primarily constructed from person identifiers and location history source data.
+4.  All pairs identified in step #1 are evaluated for links.
+5.  Cross-validation is employed to identify a match score cutoff point.
+6.  Linkage networks are evaluated and where relevant broken up into sub-clusters via a network linkage algorithm.
+7.  The results of #6 is are aggregated to ensure the internal consistency at the source system X source id level.
+
+### Code workflow (main bits)
+
+Review [`_targets.R`](_targets.R) and associated helper functions (e.g. `targets::tar_visnetwork(T)`) for understanding the process flow.
+
+### Before starting
+
+Run [create_data_duck.R](create_data_duck.R) to (re)generate the data.duckdb database. Do any migration of training ids to a new hash set (previous examples can be found in the migrations folder).
+
+### Data
+
+#### Raw Data
+
+The raw data comes from noharms.identifiers on HHSAW. There is a separate ETL process that prepares the data.
+
+#### Clean Data
+
+Data are downloaded and cleaned when loading via the [init_duck](#0) function, with most of the actual work farmed out to the [clean_noharms_ids](R\clean_noharms_ids.R) function (which `init_duck` calls). The cleaning steps are listed below.
+
+1.  Junk names not removed in the preparation of the "raw" data are set NA.
+2.  Names are limited to alpha numeric characters and cleaned (e.g. removing JRs). Name columns without spaces are also created.
+3.  SSNs are forced into compliance (e.g. 9 digits, less than 900000000)
+4.  ZIP codes are forced into compliance with the schema (5 digit number)
+5.  Junk ZIPs are removed/set to NA
+6.  NAs for certain identifiers (e.g. names, ssns) are filled in within valid responses within a given source_id/source_system.
+
+### Generating pairs for evaluation
+
+#### Block and Filter Pairs
+
+It is computationally ill advised to compare all people to each other when trying to identify matches. Listed below is the criteria used to a-priori decide whether to evaluate two records as a match. The blocking/filtering occurs via the [`make_query_grid`](R\make_query_grid.R), [`make_block_var_table`, `make_block`, and `block`](R/block.R) functions. Combined, these functions identify and store the pairs of records that meet at least one of the following conditions:
+
+1.  Exact match between DOB and last name
+2.  Exact match between DOB and first name
+3.  Exact match between valid SSNs
+4.  Exact match between last 4 of SSN and last name
+5.  Exact match between last 4 of SSN and first name
+6.  Exact match between last 4 of SSN and exact dob match
+7.  Exact match between DOB, first two letters of first name, and first two letters of last name
+8.  Exact match on first name, last name, and year of birth
+9.  Exact match on first name, last name, dob month, and dob day
+10. Exact match on DOB and jaccard similarities \>.5 for both first name and last name
+11. Exact match on DOB and if A's last name is wholly contained in B's last name
+12. Same as above, but comparing B to A (instead of A to B)
+13. Exact match on DOB and if A's firstname is wholly contained in B's first name
+14. Same as above, but comparing B to A (instead of A to B)
+15. Jaro-Winkler similarity \>.7 for first and last name and exact match on year of birth and exact match on day of birth
+16. Jaro-Winkler similarity \>.7 for first and last name and exact match on year of birth and exact match on month of birth and (an absolute difference in day of birth less than 10 OR either record's day of birth is the first of the month). Note: This condition could probably be faster as three separate AND conditions.
+
+For conditions 10+, the results from 1-9 are screened out to save on computation. [`make_query_grid`](R\make_query_grid.R) and [`make_block`](R/block.R) contain the code where this occurs.
+
+#### Generate Comparisons/Variables
+
+Once the list of pairs to evaluate has been identified, a series of predictor variables (the input to the ML model) are created. The predictor variables are created by [make_model_frame](R/make_model_frame.R) which is mostly a light wrapper on some sql. [`predict_links.R`](R/predict_links.R) and [`compile_training_data.R`](R/compile_training_data.R) are the relevant parts of the targets workflow. As of 08/15/2024 the variable list includes:
+
+1.  `dob_exact`: DOB exact match
+2.  `dob_year_exact`: exact match of year of birthm
+3.  `dob_mdham`: hamming distance between month and day of birth
+4.  `dob0101`: Either DOB is 01-01-YYYY
+5.  `gender_agree`: gender explicitly matches
+6.  `first_name_jw`: jaro-winkler distance of first names
+7.  `last_name_jw`: jaro-winkler distance of last names
+8.  `name_swap_jw`: jaro-winkler distance of names with first and last swapped
+9.  `complete_name_dl`: daimaru-levenstein distance between the full names. Full name is either first + last or first + middle + last. The minimum distance is used.
+10. `middle_initial_agree`: Explicit match of middle initial
+11. `last_in_last`: where either records' whole last name is contained in the other one
+12. `ssn_full_exact`: The full valid SSNs exactly match
+13. `ssn_last4_exact`: Last 4 digits of SSN exactly match
+14. `ssn_last_4_dl`: The daimaru-levenstein distance between the last 4 digits of ssn
+15. `first_is_middle`: first name exactly matches to middle name
+16. `first_name_freq`: created by [`create_name_frequency`](R/create_name_frequency.R). Scaled frequency tabulation of first names
+17. `last_name_freq`: created by [`create_name_frequency`](R/create_name_frequency.R). Scaled frequency tabulation of last names
+18. `dob_freq`: created by [`create_name_frequency`](R/create_name_frequency.R). Scaled frequency tabulation of dobs
+19. `mn_ziphist_distance`: Minimum observed distance of ZIP codes
+20. `exact_location`: binary flag indicating address histories overlap within 3 meters (location only – not spatio-temporal).
+21. `ssn_any_lastname`: Exact match in any last name between records with the same valid SSN. For example, the record for person A may have a name of "Jon" while person B is 'Jonathan', but there is a `Jonthan` among records that share an ssn with record A.
+22. `ssn_any_firstname`: Exact match in any first name between records with the same valid SSN
+23. `ssid_any_firstname`: Exact match in any first name between records with the same source_id and source_system
+24. `ssid_any_lastname`: Exact match in any last name between records with the same source_id and source_system
+25. `nickname_match`: Whether one first name is the nickname of the other. See [`add_nicknames_to_db.R`](R/add_nicknames_to_db.R) for sourcing and what not.
+
+### Make Linkages
+
+#### Linkage model
+
+The linkage model contains two separate sub-models, a screener and a tuned ensemble, as well as some bounds parameters. The screener model is a lasso logistic regression. Pairs with a prediction within the specified bounds, (.01 - .99) by default, are passed on to the ML ensemble model. Logistic lasso regression is used to ensemble results from tuned child models. While the child models that don't get lasso-ed out vary by model version, the candidate pool usually includes boosted mlps, random forests, boosted regression trees, neural nets, and svms. [`fit_submodel`](R/fit_submodel.R) and [`create_stacked_model`](R/create_stacked_model.R) implement the model fitting and ensembling while [fit_screening_model](R/fit_screening_model.R) fits the screener. The selection of candidate models is handled/specified in [`_targets.R`](_targets.R)
+
+#### Predict/identify links
+
+After blocking, filtering, and generating comparisons, pairs are evaluated and given a match score/prediction from the linkage model. The prediction process is parallelized by chunks of pairs to facilitate a consistent computational flow. Potential pairs with a match score of \>.05 are saved to a versioned table in HHSAW.
+
+The prediction step occurs in two main steps (within and between) via [`predict_links.R`](R/predict_links.R). Records with a shared source system and source system are assumed to be matches and are identified via [`fixed_links.R`](R/fixed_links.R).
+
+### Select match score cutoff and generate fit metrics
+
+Fit/error/goodness metrics are calculated via 5 rounds of 5-fold cross validation in [`cv_refit.R`](R/cv_refit.R) and compiled together in [`cv_cutoffs.R`](R/cv_cutoffs.R). The final cutoff (designating a match/non-match) is select at the point of greatest accuracy. EMS \<-\> RHINO and MEO \<-\> Death both have deterministic linkage logic.
+
+### Build linkage networks and find subclusters
+
+Pairs with a match score above the cutoff point are configured into networks with match score as the edge weight. To reduce the effect of bridging edges and increase network density, the Leiden clustering algorithm ([`reconcile_links.R`](R/reconcile_links.R)) is applied to networks with more than 3 vertices and a density (# of connections/# possible connections) below .7. The resulting subclusters (and the networks that did not need to be clustered) are aggregated to the source id/source system level ([`collapse_links.R`](R/collapse_links.R)). The result of the aggregations is a final "study id" that determines which records represent the same person.
+
+#### Generating new training pairs
+
+[`make_new_training_data.R`](make_new_training_data.R): Identifies new record pairs for manual review and subsequent inclusion into the training data. A few methods are implemented/regularly used:
+
+1.  Stratified sampling based on match score
+2.  Minimum numbers of evaluated pairs based on dataset combinations (e.g. there must be at least 20 pairs between EMS and Medicaid)
+3.  Minimum numbers of evaluated pairs by race/ethnicity
+4.  Top N worst predictions for training pairs (should a pair be re-evaluated? Maybe the human was wrong?)
+5.  Pairs where the ML approach disagrees with the IDH
+6.  Pairs where the previous ML version disagrees with the current one
+
+#### Labelling training data
+
+New pairs are labeled with the assistance of the `hyrule::matchmaker` shiny app (launched from [`make_new_training_data.R`](make_new_training_data.R)). Exploration into the raw data is sometimes conducted for difficult to assess cases (usually via sql).
+
+### Model Refitting
+
+Once new training data/labelled pairs are available, the ensemble is usually refit and the prediction -\> assessment -\> new pairs process begins anew.
